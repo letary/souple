@@ -1,5 +1,9 @@
 # souple-syntax
 
+[![crates.io](https://img.shields.io/crates/v/souple-syntax.svg)](https://crates.io/crates/souple-syntax)
+[![docs.rs](https://img.shields.io/docsrs/souple-syntax)](https://docs.rs/souple-syntax)
+[![license: MIT](https://img.shields.io/crates/l/souple-syntax.svg)](https://github.com/letary/souple/blob/main/LICENSE)
+
 CSS value text → the engine's typed values. The engine (`souple`) knows no strings; this
 crate is the only place that reads them. One dependency: the engine.
 

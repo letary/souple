@@ -1,5 +1,9 @@
 # souple
 
+[![crates.io](https://img.shields.io/crates/v/souple.svg)](https://crates.io/crates/souple)
+[![docs.rs](https://img.shields.io/docsrs/souple)](https://docs.rs/souple)
+[![license: MIT](https://img.shields.io/crates/l/souple.svg)](https://github.com/letary/souple/blob/main/LICENSE)
+
 A flexbox layout engine for UI trees that change. You keep a tree of boxes in it, write typed
 styles, and call one pass per frame. The pass lays out only what changed and answers exactly the
 boxes whose published layout moved.
