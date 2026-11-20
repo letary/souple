@@ -60,10 +60,10 @@ fn place(tree: &mut Tree, node: NodeId, frame: &Frame, extent: &mut Size<f32>, m
     let style = &tree.styles[slot].computed();
     let model = BoxModel::resolve(style, block, None);
     let inset = Edges {
-        left: style.inset.left.resolve(block.width),
-        right: style.inset.right.resolve(block.width),
-        top: style.inset.top.resolve(block.height),
-        bottom: style.inset.bottom.resolve(block.height),
+        left: style.inset.left.px(block.width),
+        right: style.inset.right.px(block.width),
+        top: style.inset.top.px(block.height),
+        bottom: style.inset.bottom.px(block.height),
     };
     let align = match style.align_self.unwrap_or(frame.align_items) {
         AlignItems::Stretch | AlignItems::Baseline => AlignItems::FlexStart,

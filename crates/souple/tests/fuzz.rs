@@ -43,7 +43,7 @@ use std::fmt::Write as _;
 use std::panic::{self, AssertUnwindSafe};
 
 use souple::{
-    AlignContent, AlignItems, Available, BoxSizing, Change, Display, Edges, FlexDirection, FlexWrap, Formula,
+    AlignContent, AlignItems, Available, BoxEdges, BoxSizing, Change, Display, Edges, FlexDirection, FlexWrap, Formula,
     JustifyContent, Length, MeasureInput, MeasureOutput, Measurer, NodeId, NodeLayout, Op as F, Overflow, Position,
     Size, Style, Tree, VarId, Viewport,
 };
@@ -534,7 +534,7 @@ impl Measurer for Fake<'_> {
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Port {
     Size(Size<Option<f32>>),
-    Node(u32),
+    Host(u32),
 }
 
 #[derive(Clone)]
@@ -559,6 +559,9 @@ enum Op {
     Detach(u32),
     SetStyle(u32, Box<Style>),
     Edit(u32, Edit),
+    /// The same edit in place (`edit_style`), answering whether it changed the style — or `true`
+    /// whatever it did (`eager`), which the contract allows.
+    EditInPlace(u32, Edit, bool),
     Measured(u32, bool),
     Hug(u32, bool),
     /// New content, and the `mark_dirty` the contract asks for.
@@ -571,6 +574,9 @@ enum Op {
     ScopeHost(u32, Option<u32>),
     Scale(f32),
     Pass,
+    /// An insert, a viewport or a scope host the model refuses (every node it names alive): the
+    /// tree's `try_` form must refuse it too, and leave the tree as it was.
+    Refused(Box<Op>),
 }
 
 impl Op {
@@ -585,6 +591,9 @@ impl Op {
             Op::Detach(id) => format!("detach(n{id})"),
             Op::SetStyle(id, style) => format!("set_style(n{id}, {})", style_diff(style)),
             Op::Edit(id, edit) => format!("update_style(n{id}, {})", describe_edit(edit)),
+            Op::EditInPlace(id, edit, eager) => {
+                format!("edit_style(n{id}, {}){}", describe_edit(edit), if *eager { " -> true" } else { "" })
+            }
             Op::Measured(id, on) => format!("set_measured(n{id}, {on})"),
             Op::Hug(id, on) => format!("set_hug(n{id}, {on})"),
             Op::Content(id, content) => format!("content(n{id}) = {content:?}; mark_dirty(n{id})"),
@@ -592,8 +601,9 @@ impl Op {
             Op::Var(id, var, value) => format!("set_var(n{id}, var {}, {value:?})", var.index()),
             Op::Global(var, value) => format!("set_global(var {}, {value:?})", var.index()),
             Op::Viewport(id, Port::Size(size)) => format!("set_viewport(n{id}, Size({:?}, {:?}))", size.width, size.height),
-            Op::Viewport(id, Port::Node(host)) => format!("set_viewport(n{id}, Viewport::node(n{host}))"),
+            Op::Viewport(id, Port::Host(host)) => format!("set_viewport(n{id}, Viewport::host(n{host}))"),
             Op::ClearViewport(id) => format!("clear_viewport(n{id})"),
+            Op::Refused(op) => format!("refused: {}", op.describe()),
             Op::ScopeHost(id, host) => {
                 format!("set_scope_host(n{id}, {})", host.map_or("None".to_string(), |h| format!("Some(n{h})")))
             }
@@ -610,7 +620,7 @@ fn describe_edit(edit: &Edit) -> String {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Model {
     nodes: Vec<Option<ModelNode>>,
     globals: Vec<(VarId, f32)>,
@@ -662,7 +672,7 @@ impl Model {
             match node.parent {
                 Some(parent) => stack.push(parent),
                 None => {
-                    if let Some(Port::Node(host)) = node.viewport {
+                    if let Some(Port::Host(host)) = node.viewport {
                         stack.push(host);
                     }
                     if let Some(host) = node.scope_host {
@@ -679,7 +689,7 @@ impl Model {
     fn fully_live(&self, root: u32) -> bool {
         match self.get(root).and_then(|node| node.viewport) {
             Some(Port::Size(_)) => true,
-            Some(Port::Node(host)) => self.fully_live(self.root_of(host)),
+            Some(Port::Host(host)) => self.fully_live(self.root_of(host)),
             None => false,
         }
     }
@@ -732,7 +742,7 @@ impl Model {
                 self.unlink(*id);
                 for live in self.live_ids() {
                     let node = self.node(live);
-                    if matches!(node.viewport, Some(Port::Node(host)) if gone.contains(&host)) {
+                    if matches!(node.viewport, Some(Port::Host(host)) if gone.contains(&host)) {
                         node.viewport = None;
                     }
                     if node.scope_host.is_some_and(|host| gone.contains(&host)) {
@@ -774,7 +784,7 @@ impl Model {
                 }
                 self.node(*id).style = (**style).clone();
             }
-            Op::Edit(id, edit) => {
+            Op::Edit(id, edit) | Op::EditInPlace(id, edit, _) => {
                 if !self.alive(*id) {
                     return false;
                 }
@@ -821,7 +831,7 @@ impl Model {
                 if !self.alive(*id) || self.get(*id).unwrap().parent.is_some() {
                     return false;
                 }
-                if matches!(*port, Port::Node(host) if !self.alive(host) || self.reaches(host, *id)) {
+                if matches!(*port, Port::Host(host) if !self.alive(host) || self.reaches(host, *id)) {
                     return false;
                 }
                 self.node(*id).viewport = Some(*port);
@@ -840,6 +850,17 @@ impl Model {
                     return false;
                 }
                 self.node(*id).scope_host = *host;
+            }
+            Op::Refused(op) => {
+                // Attempted only while the model refuses it, every node it names alive.
+                let named = match &**op {
+                    Op::Insert { parent, child, before } => vec![Some(*parent), Some(*child), *before],
+                    Op::Viewport(id, Port::Host(host)) => vec![Some(*id), Some(*host)],
+                    Op::Viewport(id, Port::Size(_)) => vec![Some(*id)],
+                    Op::ScopeHost(id, host) => vec![Some(*id), *host],
+                    _ => return false,
+                };
+                return named.into_iter().flatten().all(|id| self.alive(id)) && !self.clone().apply(op);
             }
             Op::Scale(scale) => {
                 // The library ignores a scale that is not a positive finite number.
@@ -931,7 +952,7 @@ fn generate(seed: u64) -> Vec<Op> {
         } else if g.rng.chance(50) {
             let live = model.live_ids();
             let host = g.rng.pick(&live);
-            push(&mut model, &mut ops, Op::Viewport(root, Port::Node(host)));
+            push(&mut model, &mut ops, Op::Viewport(root, Port::Host(host)));
         }
     }
     ops.push(Op::Pass);
@@ -949,7 +970,14 @@ fn generate(seed: u64) -> Vec<Op> {
             let node = g.rng.pick(&live);
             let other = g.rng.pick(&live);
             let op = match g.rng.below(100) {
-                0..=21 => Op::Edit(node, g.edit()),
+                0..=21 => {
+                    let edit = g.edit();
+                    match g.rng.below(4) {
+                        0 => Op::EditInPlace(node, edit, false),
+                        1 => Op::EditInPlace(node, edit, true),
+                        _ => Op::Edit(node, edit),
+                    }
+                }
                 22..=26 => Op::SetStyle(node, Box::new(g.style())),
                 27..=36 => {
                     let siblings = model.get(other).unwrap().children.clone();
@@ -980,12 +1008,18 @@ fn generate(seed: u64) -> Vec<Op> {
                 }
                 79..=82 => Op::Global(g.var(), g.px()),
                 83..=88 => Op::Viewport(model.root_of(node), Port::Size(g.viewport_size())),
-                89..=90 => Op::Viewport(model.root_of(node), Port::Node(other)),
+                89..=90 => Op::Viewport(model.root_of(node), Port::Host(other)),
                 91..=92 => Op::ClearViewport(model.root_of(node)),
                 93..=94 => Op::ScopeHost(model.root_of(node), if g.rng.chance(70) { Some(other) } else { None }),
                 _ => Op::Scale(g.scale()),
             };
-            push(&mut model, &mut ops, op);
+            // An edit the model refuses (a loop, a viewport on a child …) is tried on the tree all the same.
+            let tried = matches!(op, Op::Insert { .. } | Op::Viewport(..) | Op::ScopeHost(..)).then(|| op.clone());
+            if !push(&mut model, &mut ops, op)
+                && let Some(op) = tried
+            {
+                push(&mut model, &mut ops, Op::Refused(Box::new(op)));
+            }
         }
         ops.push(Op::Pass);
     }
@@ -998,6 +1032,8 @@ fn generate(seed: u64) -> Vec<Op> {
 enum Kind {
     Panic,
     NonFinite,
+    Children,
+    Refusal,
     Scratch,
     ChangeSet,
     SecondPass,
@@ -1013,7 +1049,7 @@ struct Failure {
 }
 
 fn finite(layout: &NodeLayout) -> bool {
-    let NodeLayout { rect, margin, padding, border, content_size } = layout;
+    let NodeLayout { rect, content_size, unsnapped: BoxEdges { margin, padding, border } } = layout;
     let edges = |e: &Edges<f32>| [e.left, e.top, e.right, e.bottom];
     [rect.x, rect.y, rect.width, rect.height, content_size.width, content_size.height]
         .into_iter()
@@ -1059,6 +1095,29 @@ impl Run {
         self.hostile.map(|seed| Rng(seed ^ (self.passes as u64).wrapping_mul(0x2545_F491_4F6C_DD1D)))
     }
 
+    /// An insert, a viewport or a scope host, through the tree's `try_` form.
+    fn try_edit(&mut self, op: &Op) -> Result<(), souple::EditError> {
+        let id = |run: &Self, model_id: u32| run.ids[&model_id];
+        match op {
+            Op::Insert { parent, child, before } => {
+                let before = before.map(|b| id(self, b));
+                self.tree.try_insert(id(self, *parent), id(self, *child), before)
+            }
+            Op::Viewport(model_id, port) => {
+                let viewport = match *port {
+                    Port::Size(size) => Viewport::Size(size),
+                    Port::Host(host) => Viewport::host(id(self, host)),
+                };
+                self.tree.try_set_viewport(id(self, *model_id), viewport)
+            }
+            Op::ScopeHost(model_id, host) => {
+                let host = host.map(|h| id(self, h));
+                self.tree.try_set_scope_host(id(self, *model_id), host)
+            }
+            other => unreachable!("no try_ form: {}", other.describe()),
+        }
+    }
+
     fn apply(&mut self, op: &Op, at: usize) -> Result<(), Failure> {
         if !self.model.apply(op) {
             return Ok(());
@@ -1087,13 +1146,28 @@ impl Run {
                     }
                 }
             }
-            Op::Insert { parent, child, before } => {
-                let before = before.map(|b| id(self, b));
-                self.tree.insert(id(self, *parent), id(self, *child), before);
+            Op::Insert { .. } | Op::Viewport(..) | Op::ScopeHost(..) => {
+                if let Err(error) = self.try_edit(op) {
+                    return Err(Failure { kind: Kind::Refusal, at, message: format!("refused an edit the model accepts: {error}") });
+                }
+            }
+            Op::Refused(edit) => {
+                let before = (format!("{:#?}", self.tree), self.tree.needs_layout());
+                if self.try_edit(edit).is_ok() {
+                    return Err(Failure { kind: Kind::Refusal, at, message: "accepted an edit the model refuses".to_string() });
+                }
+                if (format!("{:#?}", self.tree), self.tree.needs_layout()) != before {
+                    return Err(Failure { kind: Kind::Refusal, at, message: "a refused edit changed the tree".to_string() });
+                }
             }
             Op::Detach(model_id) => self.tree.detach(id(self, *model_id)),
             Op::SetStyle(model_id, style) => self.tree.set_style(id(self, *model_id), (**style).clone()),
             Op::Edit(model_id, edit) => self.tree.update_style(id(self, *model_id), |style| edit.apply(style)),
+            Op::EditInPlace(model_id, edit, eager) => self.tree.edit_style(id(self, *model_id), |style| {
+                let before = style.clone();
+                edit.apply(style);
+                *eager || *style != before
+            }),
             Op::Measured(model_id, on) => self.tree.set_measured(id(self, *model_id), *on),
             Op::Hug(model_id, on) => self.tree.set_hug(id(self, *model_id), *on),
             Op::Content(model_id, content) => {
@@ -1104,18 +1178,7 @@ impl Run {
             Op::MarkDirty(model_id) => self.tree.mark_dirty(id(self, *model_id)),
             Op::Var(model_id, var, value) => self.tree.set_var(id(self, *model_id), *var, *value),
             Op::Global(var, value) => self.tree.set_global(*var, *value),
-            Op::Viewport(model_id, port) => {
-                let viewport = match *port {
-                    Port::Size(size) => Viewport::Size(size),
-                    Port::Node(host) => Viewport::node(id(self, host)),
-                };
-                self.tree.set_viewport(id(self, *model_id), viewport);
-            }
             Op::ClearViewport(model_id) => self.tree.clear_viewport(id(self, *model_id)),
-            Op::ScopeHost(model_id, host) => {
-                let host = host.map(|h| id(self, h));
-                self.tree.set_scope_host(id(self, *model_id), host);
-            }
             Op::Scale(scale) => self.tree.set_scale(*scale),
             Op::Pass => return self.pass(at),
         }
@@ -1136,6 +1199,15 @@ impl Run {
             let layout = self.tree.layout(self.ids[&m]);
             if !finite(layout) {
                 return fail(Kind::NonFinite, format!("n{m} published {layout:?}"));
+            }
+        }
+
+        // Every child list is the model's: its count (kept, not walked) and its walk.
+        for &m in &live {
+            let (node, expected) = (self.ids[&m], self.model.get(m).unwrap().children.len());
+            let (count, walked) = (self.tree.child_count(node), self.tree.children(node).count());
+            if count != expected || walked != expected {
+                return fail(Kind::Children, format!("n{m}: child_count {count}, {walked} walked, the model has {expected}"));
             }
         }
 
@@ -1163,11 +1235,10 @@ impl Run {
                     let flags = (
                         (new.rect.x, new.rect.y) != (old.rect.x, old.rect.y),
                         (new.rect.width, new.rect.height) != (old.rect.width, old.rect.height),
-                        (new.margin, new.padding, new.border, new.content_size)
-                            != (old.margin, old.padding, old.border, old.content_size),
+                        (new.unsnapped, new.content_size) != (old.unsnapped, old.content_size),
                     );
-                    if (change.moved, change.resized, change.inner) != flags {
-                        return fail(Kind::ChangeSet, format!("n{m}: flags {change:?}, expected (moved, resized, inner) = {flags:?}"));
+                    if (change.moved, change.resized, change.box_model) != flags {
+                        return fail(Kind::ChangeSet, format!("n{m}: flags {change:?}, expected (moved, resized, box_model) = {flags:?}"));
                     }
                     self.published.insert(m);
                 }
@@ -1242,7 +1313,7 @@ impl Run {
         for &m in &live {
             match model.get(m).unwrap().viewport {
                 Some(Port::Size(size)) => fresh.set_viewport(ids[&m], Viewport::Size(size)),
-                Some(Port::Node(host)) => fresh.set_viewport(ids[&m], Viewport::node(ids[&host])),
+                Some(Port::Host(host)) => fresh.set_viewport(ids[&m], Viewport::host(ids[&host])),
                 None => {}
             }
         }
@@ -1269,7 +1340,7 @@ impl Run {
                 }
                 let node = model.get(id).unwrap();
                 at = node.parent.or(match node.viewport {
-                    Some(Port::Node(host)) => Some(host),
+                    Some(Port::Host(host)) => Some(host),
                     _ => None,
                 });
             }
@@ -1319,7 +1390,7 @@ fn snapping_difference(a: &NodeLayout, b: &NodeLayout, scale: f32) -> bool {
         let whole = off.round();
         whole.abs() <= 2.0 && (off - whole).abs() <= 0.01
     };
-    (a.margin, a.padding, a.border, a.content_size) == (b.margin, b.padding, b.border, b.content_size)
+    (a.unsnapped, a.content_size) == (b.unsnapped, b.content_size)
         && pixels(a.rect.x, b.rect.x)
         && pixels(a.rect.y, b.rect.y)
         && pixels(a.rect.width, b.rect.width)
@@ -1348,10 +1419,10 @@ fn absolute(
             let (x, y, _) = absolute(model, tree, ids, parent, memo);
             (x, y)
         }
-        (None, Some(Port::Node(host))) => {
+        (None, Some(Port::Host(host))) => {
             let (x, y, _) = absolute(model, tree, ids, host, memo);
             let host = tree.layout(ids[&host]);
-            (x + host.border.left + host.padding.left, y + host.border.top + host.padding.top)
+            (x + host.unsnapped.border.left + host.unsnapped.padding.left, y + host.unsnapped.border.top + host.unsnapped.padding.top)
         }
         _ => (0.0, 0.0),
     };
@@ -1427,12 +1498,13 @@ fn env_number(name: &str) -> Option<u64> {
 fn fuzz(name: &str, default_cases: u64, hostile_measurer: bool) {
     let cases = env_number("SOUPLE_FUZZ_CASES").unwrap_or(default_cases);
     let base = env_number("SOUPLE_FUZZ_SEED").unwrap_or(0x5009_1E00);
-    let (mut ops_total, mut passes_total, mut snapped) = (0usize, 0usize, 0usize);
+    let (mut ops_total, mut passes_total, mut snapped, mut refused) = (0usize, 0usize, 0usize, 0usize);
     let started = std::time::Instant::now();
     for case in 0..cases {
         let seed = base.wrapping_add(case);
         let ops = generate(seed);
         ops_total += ops.len();
+        refused += ops.iter().filter(|op| matches!(op, Op::Refused(_))).count();
         passes_total += ops.iter().filter(|op| matches!(op, Op::Pass)).count();
         let hostile = hostile_measurer.then_some(seed);
         let failure = match replay(&ops, hostile) {
@@ -1463,7 +1535,7 @@ fn fuzz(name: &str, default_cases: u64, hostile_measurer: bool) {
         panic!("{report}");
     }
     eprintln!(
-        "{name}: {cases} cases, {ops_total} ops, {passes_total} passes in {:.1} s; {snapped} boxes a device px or two \
+        "{name}: {cases} cases, {ops_total} ops ({refused} edits refused), {passes_total} passes in {:.1} s; {snapped} boxes a device px or two \
          off after a whole-pixel move (an edge within float error of a tie: the known snapping difference)",
         started.elapsed().as_secs_f64()
     );

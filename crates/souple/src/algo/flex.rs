@@ -205,8 +205,8 @@ impl Container {
     /// stays 0 once a height has come from the content (Chrome does not resolve it again).
     fn resolve_gaps(&mut self, style: &Style) {
         let base = self.percent_base();
-        let between_columns = style.column_gap.resolve_or_zero(base.width).max(0.0);
-        let between_rows = style.row_gap.resolve_or_zero(base.height).max(0.0);
+        let between_columns = style.column_gap.px_or_zero(base.width).max(0.0);
+        let between_rows = style.row_gap.px_or_zero(base.height).max(0.0);
         (self.gap_main, self.gap_cross) =
             if self.axes.row { (between_columns, between_rows) } else { (between_rows, between_columns) };
     }
@@ -276,7 +276,7 @@ fn collect_items(tree: &mut Tree, c: &Container, items: &mut Vec<Item>, mode: Mo
         // (`calc(10px - 50%)`): CSS clamps a basis at 0, as it does every size.
         let basis = style
             .flex_basis
-            .resolve(c.percent_base().main(row))
+            .px(c.percent_base().main(row))
             .map(|px| px.max(0.0))
             .map(|px| if model.border_box { px } else { px + pb.main(row) });
         let min_length = if row { &style.min_size.width } else { &style.min_size.height };

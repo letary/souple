@@ -408,7 +408,7 @@ fn padding_and_margin_percents_are_of_the_width_on_every_edge() {
     let a = child(&mut tree, root, style);
     tree.compute_layout(&mut NoMeasure);
     assert_eq!(rect(&tree, a), [20.0, 0.0, 100.0, 90.0]);
-    assert_eq!(tree.layout(a).padding.top, 40.0);
+    assert_eq!(tree.layout(a).unsnapped.padding.top, 40.0);
 }
 
 #[test]

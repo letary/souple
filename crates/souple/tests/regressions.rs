@@ -7,7 +7,7 @@ use souple::{
 };
 
 fn every_number(layout: &NodeLayout) -> [f32; 18] {
-    let NodeLayout { rect, margin, padding, border, content_size } = *layout;
+    let NodeLayout { rect, content_size, unsnapped: souple::BoxEdges { margin, padding, border } } = *layout;
     let e = |e: Edges<f32>| [e.left, e.top, e.right, e.bottom];
     let [ml, mt, mr, mb] = e(margin);
     let [pl, pt, pr, pb] = e(padding);
@@ -84,9 +84,8 @@ fn a_viewport_axis_that_is_not_finite_is_unbounded() {
 }
 
 #[test]
-#[should_panic(expected = "hosted inside itself")]
 fn a_cycle_through_a_shadowed_scope_host_is_refused() {
-    // A root's scope host is not followed while it has a `Viewport::Node`, so the check looked past
+    // A root's scope host is not followed while it has a `Viewport::Host`, so the check looked past
     // it: the loop below was accepted and closed the moment the viewport went — and every walk up
     // the scope chain (`var`, the next pass) never ended.
     let mut tree = Tree::new();
@@ -99,10 +98,10 @@ fn a_cycle_through_a_shadowed_scope_host_is_refused() {
     let (a, a1) = tree_of(&mut tree);
     let (_b, h1) = tree_of(&mut tree);
     let (c, c1) = tree_of(&mut tree);
-    tree.set_viewport(a, Viewport::node(h1));
+    tree.set_viewport(a, Viewport::host(h1));
     tree.set_scope_host(a, Some(c1));
     // a → c1 → c → a1 → a: refused now (it was accepted).
-    tree.set_scope_host(c, Some(a1));
+    assert_eq!(tree.try_set_scope_host(c, Some(a1)), Err(souple::EditError::Cycle));
     tree.clear_viewport(a);
     tree.var(a1, souple::VarId::new(0));
 }

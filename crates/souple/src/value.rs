@@ -15,7 +15,7 @@ use std::sync::Arc;
 /// ([`VarSet`]) — what keeps a variable change to the subtrees that read it, at no cost per
 /// variable. An embedder with more units than this maps several onto one id, or resolves the rest
 /// to px itself.
-pub const MAX_VARS: u8 = 64;
+pub const MAX_VARS: usize = 64;
 
 /// A variable: a number defined on nodes ([`crate::Tree::set_var`]) or for the whole tree
 /// ([`crate::Tree::set_global`]), read by a [`Length::Var`] or a [`Formula`] through the scope
@@ -31,7 +31,7 @@ impl VarId {
     ///
     /// If `index >= MAX_VARS` (64) — at compile time in a `const`.
     pub const fn new(index: u8) -> Self {
-        assert!(index < MAX_VARS, "a variable id is below MAX_VARS");
+        assert!((index as usize) < MAX_VARS, "a variable id is below MAX_VARS");
         Self(index)
     }
 
@@ -141,28 +141,60 @@ impl Length {
     }
 
     /// The length in px. `base` is what a percent is of; `None` = not known (an indefinite size).
-    /// `None` back: the length is `Auto`, or holds a percent of an unknown base — which CSS treats
-    /// as `auto` too. A COMPUTED length only ([`Length::substitute`] first): a variable left in it
-    /// reads as 0, and fails a debug assertion.
-    pub fn resolve(&self, base: Option<f32>) -> Option<f32> {
+    /// `value_of` is a variable's value where the length is read — [`crate::Tree::var`] of the node,
+    /// or the embedder's own numbers — as [`Formula::eval`] takes it. `None` back: the length is
+    /// `Auto`, or holds a percent of an unknown base — which CSS treats as `auto` too.
+    ///
+    /// ```
+    /// # use souple::{Length, VarId};
+    /// const EM: VarId = VarId::new(0);
+    /// let em = |_: VarId| 16.0;
+    /// assert_eq!(Length::Var(EM, 2.0).resolve(None, &em), Some(32.0));
+    /// assert_eq!(Length::Percent(50.0).resolve(Some(300.0), &em), Some(150.0));
+    /// assert_eq!(Length::Percent(50.0).resolve(None, &em), None);
+    /// ```
+    pub fn resolve(&self, base: Option<f32>, value_of: &impl Fn(VarId) -> f32) -> Option<f32> {
         match self {
             Self::Auto => None,
             Self::Px(px) => Some(*px),
             Self::Percent(percent) => base.map(|base| base * percent / 100.0),
-            Self::Var(..) => {
-                debug_assert!(false, "a computed length holds no variable");
-                Some(0.0)
-            }
-            Self::Calc(formula) => formula.eval(base, &|_| {
-                debug_assert!(false, "a computed length holds no variable");
-                0.0
-            }),
+            Self::Var(var, factor) => Some(factor * value_of(*var)),
+            Self::Calc(formula) => formula.eval(base, value_of),
         }
     }
 
     /// [`Length::resolve`] with `Auto` and an unknown percent as 0: for paddings, borders, gaps.
-    pub fn resolve_or_zero(&self, base: Option<f32>) -> f32 {
-        self.resolve(base).unwrap_or(0.0)
+    pub fn resolve_or_zero(&self, base: Option<f32>, value_of: &impl Fn(VarId) -> f32) -> f32 {
+        self.resolve(base, value_of).unwrap_or(0.0)
+    }
+
+    /// A COMPUTED length in px (the algorithm's reads: every variable substituted already).
+    pub(crate) fn px(&self, base: Option<f32>) -> Option<f32> {
+        self.resolve(base, &|_| {
+            debug_assert!(false, "a computed length holds no variable");
+            0.0
+        })
+    }
+
+    /// [`Length::px`] with `Auto` and an unknown percent as 0.
+    pub(crate) fn px_or_zero(&self, base: Option<f32>) -> f32 {
+        self.px(base).unwrap_or(0.0)
+    }
+
+    /// A formula length — `calc()`, `min()`, `max()`, `clamp()` — from its postfix program: the
+    /// program validated and every constant part folded, so the answer is the simplest length that
+    /// says the same (`calc(10px + 5px)` is `Length::Px(15.0)`, a [`Length::Calc`] only when one is
+    /// needed). The way to make one ([`Formula::build`] is the same call).
+    ///
+    /// ```
+    /// # use souple::{Length, Op};
+    /// // calc(100% - 20px)
+    /// let length = Length::calc(&[Op::Percent(100.0), Op::Px(20.0), Op::Sub]).unwrap();
+    /// assert_eq!(length.resolve(Some(300.0), &|_| 0.0), Some(280.0));
+    /// assert_eq!(Length::calc(&[Op::Px(10.0), Op::Px(5.0), Op::Add]), Ok(Length::Px(15.0)));
+    /// ```
+    pub fn calc(ops: &[Op]) -> Result<Length, FormulaError> {
+        Formula::build(ops)
     }
 }
 
@@ -237,7 +269,8 @@ impl Formula {
     pub const MAX_DEPTH: usize = 16;
 
     /// Validates `ops` and folds every constant part. The answer is the simplest length that says
-    /// the same: `calc(10px + 5px)` is `Length::Px(15.0)`, a formula only when one is needed.
+    /// the same: `calc(10px + 5px)` is `Length::Px(15.0)`, a formula only when one is needed. The
+    /// same as [`Length::calc`], the documented way to make a formula length.
     ///
     /// Any number is accepted in an operand (NaN and infinities included: the layout makes
     /// something finite of them); only the program's shape and types are checked.
@@ -481,19 +514,19 @@ mod tests {
     #[test]
     fn percent_and_px_mix() {
         let length = calc(&[Op::Percent(100.0), Op::Px(20.0), Op::Sub]);
-        assert_eq!(length.resolve(Some(300.0)), Some(280.0));
-        assert_eq!(length.resolve(None), None, "a percent of an unknown base is auto");
+        assert_eq!(length.px(Some(300.0)), Some(280.0));
+        assert_eq!(length.px(None), None, "a percent of an unknown base is auto");
     }
 
     #[test]
     fn min_max_clamp() {
         let min = calc(&[Op::Percent(50.0), Op::Px(100.0), Op::Px(400.0), Op::Min(3)]);
-        assert_eq!(min.resolve(Some(1000.0)), Some(100.0));
-        assert_eq!(min.resolve(Some(100.0)), Some(50.0));
+        assert_eq!(min.px(Some(1000.0)), Some(100.0));
+        assert_eq!(min.px(Some(100.0)), Some(50.0));
         let clamp = calc(&[Op::Px(10.0), Op::Percent(50.0), Op::Px(30.0), Op::Clamp]);
-        assert_eq!(clamp.resolve(Some(10.0)), Some(10.0));
-        assert_eq!(clamp.resolve(Some(40.0)), Some(20.0));
-        assert_eq!(clamp.resolve(Some(400.0)), Some(30.0));
+        assert_eq!(clamp.px(Some(10.0)), Some(10.0));
+        assert_eq!(clamp.px(Some(40.0)), Some(20.0));
+        assert_eq!(clamp.px(Some(400.0)), Some(30.0));
     }
 
     #[test]
@@ -507,7 +540,19 @@ mod tests {
         // calc(100% - 2em) stays a formula, without the variable.
         let mixed = calc(&[Op::Percent(100.0), Op::Var(EM, 2.0), Op::Sub]).substitute(&values);
         assert!(mixed.vars().is_empty());
-        assert_eq!(mixed.resolve(Some(100.0)), Some(68.0));
+        assert_eq!(mixed.px(Some(100.0)), Some(68.0));
+    }
+
+    #[test]
+    fn a_variable_length_resolves_with_its_values() {
+        let values = |var: VarId| if var == EM { 16.0 } else { 4.0 };
+        assert_eq!(Length::Var(EM, 2.0).resolve(None, &values), Some(32.0));
+        // calc(100% - 2em), the variable read where it is resolved: the same as substituted first.
+        let mixed = Length::calc(&[Op::Percent(100.0), Op::Var(EM, 2.0), Op::Sub]).unwrap();
+        assert_eq!(mixed.resolve(Some(100.0), &values), Some(68.0));
+        assert_eq!(mixed.resolve(Some(100.0), &values), mixed.substitute(&values).px(Some(100.0)));
+        assert_eq!(Length::Auto.resolve(Some(100.0), &values), None);
+        assert_eq!(Length::Percent(10.0).resolve_or_zero(None, &values), 0.0);
     }
 
     #[test]

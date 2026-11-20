@@ -71,15 +71,27 @@ assert_eq!(tree.layout(cancel).rect.x, 184.0);
 
 **Nodes.** A `Tree` owns a forest. `create_node` (or `create_node_with_style`, a builder's way in)
 makes a detached node; `insert(parent, child, before)` / `append` puts it under a parent — and
-MOVES it if it had one; `detach` makes it a root again; `destroy` frees it and its subtree. A
-`NodeId` is a slot and a generation: a destroyed node's id goes stale, and every method that takes
-one panics on it rather than touch another node (`is_alive` asks first). Every node is a flex
-container and a flex item at once.
+MOVES it if it had one; `detach` makes it a root again; `destroy` frees it and its subtree;
+`child_count` is kept, not counted. A `NodeId` is a slot and a generation: a destroyed node's id
+goes stale, and every method that takes one panics on it rather than touch another node
+(`is_alive` asks first). Every node is a flex container and a flex item at once. `{:?}` of a tree
+is a screenful of it (each root and its first levels, what is left out counted); `{:#?}` is every
+node.
+
+**Edits that may be refused.** An insert, a viewport and a scope host may make no loop of parents
+and hosts, and the tree refuses one that would — finding it is a walk up the chains, which an
+embedder cannot cheaply do first. Each has a `try_` form (`try_insert`, `try_append`,
+`try_set_viewport`, `try_set_scope_host`) that answers `Err(EditError)` — `Cycle`, `HasViewport`,
+`NotARoot`, `NotASibling`, `Destroyed` — and then changes nothing; the plain form panics with the
+same reason. An embedder whose edits come from an app or a host (and that runs with
+`panic = "abort"`) calls the `try_` forms and refuses the request.
 
 **Styles.** A `Style` is plain data under CSS's names, with CSS's initial values as its `Default`:
 a row, `flex-shrink: 1`, `align-items: stretch`, `box-sizing: content-box`, auto sizes and
 minimums. Write a whole one (`set_style`) or edit fields (`update_style(node, |s| ...)`); the same
-style again costs a comparison and lays out nothing.
+style again costs a comparison and lays out nothing. An embedder that writes one property at a
+time edits the style where it is (`edit_style(node, |s| ...)`, its closure answering whether it
+changed anything): no copy, no comparison of the whole style.
 
 **Measured leaves.** `set_measured(node, true)` makes a node content-sized: its size comes from the
 `Measurer` passed to the pass, asked in content-box px with what the layout knows (`known`) and
@@ -94,7 +106,7 @@ makes a leaf as wide as its content says it is (its longest line, its ellipsized
 React Native, SwiftUI and Flutter size text.
 
 **Roots and viewports.** A root is laid out only once it has a viewport: `Viewport::size(w, h)`,
-`::width(w)` (any height: a list item), `::height(h)`, `::unbounded()`, or `Viewport::node(host)` —
+`::width(w)` (any height: a list item), `::height(h)`, `::unbounded()`, or `Viewport::host(host)` —
 the content box of a node in another tree (a pager's page, a dialog over its screen), laid out
 after its host in the same pass. `clear_viewport` takes it away; the boxes stay as they were.
 `set_scale` sets the device px per logical px the boxes are snapped to (1 until set).
@@ -103,16 +115,19 @@ after its host in the same pass. `clear_viewport` takes it away; the boxes stay 
 and snaps the boxes. Then `changes()` is a `&[Change]`: each node whose published layout differs
 from the last pass's, once (a node published for the first time always). It stays readable until
 the next pass, alongside `layout(node)` — the way to walk it while reading the tree. `layout(node)`
-is the box (`NodeLayout`): the border box relative to the parent, the resolved margins, padding and
-border, and the content size (what a scroll container scrolls). A pass with nothing to do changes
+is the box (`NodeLayout`): the border box relative to the parent and the content size (what a
+scroll container scrolls), both snapped to the device grid, and under `unsnapped` the resolved
+margins, padding and border widths, unrounded (`Change::box_model`: those or the content size
+moved). A pass with nothing to do changes
 nothing and costs nothing; `needs_layout` says whether one would, and `needs_layout_at(node)` asks
 the same of one subtree — whether anything under it changed, for an embedder that lays a root out
 on demand.
 
 **Lengths, formulas and variables.** A `Length` is `Auto`, `Px`, `Percent` of the property's base,
 `Var(var, factor)` — a multiple of a variable — or `Calc`, a formula of `+ - * /`, `min`, `max`,
-`clamp` built once by `Formula::build` (validated and constant-folded; `calc(10px + 5px)` comes back
-as `Px(15.0)`). A variable is a number defined on a node for its subtree (`set_var`) or for the
+`clamp` built once by `Length::calc` (validated and constant-folded; `calc(10px + 5px)` comes back
+as `Px(15.0)`). `resolve(base, value_of)` is a length in px, its variables read from `value_of`
+(`Tree::var` where it is read, or the embedder's own numbers). A variable is a number defined on a node for its subtree (`set_var`) or for the
 whole tree (`set_global`), read by the nearest definition up the scope chain: the parents, then a
 hosted root's host (or the scope host of `set_scope_host`, for a root the embedder lays out on its
 own). Ids are the embedder's numbering, `VarId::new(0)` to `VarId::new(63)`: one tree tells
@@ -120,7 +135,7 @@ own). Ids are the embedder's numbering, `VarId::new(0)` to `VarId::new(63)`: one
 which is what lets a new value re-resolve only the styles that read it.
 
 ```rust
-use souple::{Formula, Length, NoMeasure, Op, Size, Style, Tree, VarId, Viewport};
+use souple::{Length, NoMeasure, Op, Size, Style, Tree, VarId, Viewport};
 
 // The engine knows no units: `em` and `vw` are variables the embedder numbers.
 const EM: VarId = VarId::new(0);
@@ -145,9 +160,10 @@ tree.compute_layout(&mut NoMeasure);
 assert_eq!(tree.changes().len(), 1, "the card");
 
 // calc(100% - 2em), in postfix.
-let inner = Formula::build(&[Op::Percent(100.0), Op::Var(EM, 2.0), Op::Sub]).unwrap();
+let inner = Length::calc(&[Op::Percent(100.0), Op::Var(EM, 2.0), Op::Sub]).unwrap();
 assert!(matches!(inner, Length::Calc(_)));
-assert_eq!(Formula::build(&[Op::Px(10.0), Op::Px(5.0), Op::Add]), Ok(Length::Px(15.0)));
+assert_eq!(inner.resolve(Some(300.0), &|_| 16.0), Some(268.0));
+assert_eq!(Length::calc(&[Op::Px(10.0), Op::Px(5.0), Op::Add]), Ok(Length::Px(15.0)));
 ```
 
 ## Hostile input
@@ -162,12 +178,12 @@ overflow saturates at the largest finite `f32`. Beyond that, what a degenerate t
 unspecified: finite, not meaningful. Past 2^24 device px from its root (16,777,216 px at scale 1) an
 `f32` no longer holds every whole pixel, and boxes there are only as exact as that.
 
-What panics is a programming error, and each case is documented on its method: a stale `NodeId`; a
-`VarId` of 64 or more; and the edits the API refuses — a viewport or a scope host on a node that
-has a parent, inserting a root that has a viewport, a node inserted under itself or before a node
-that is not a child of the parent, a root hosted inside itself through any chain of parents,
-viewport hosts and scope hosts. A formula that cannot be built is an `Err`, not a panic. (In debug
-builds, `Length::resolve` asserts it holds no variable.)
+What panics is a programming error, and each case is documented on its method: a stale `NodeId`
+and a `VarId` of 64 or more. The edits the tree refuses — a viewport or a scope host on a node
+that has a parent, inserting a root that has a viewport, a node inserted under itself or before a
+node that is not a child of the parent, a root hosted inside itself through any chain of parents,
+viewport hosts and scope hosts — panic in their plain form and are an `Err(EditError)` in their
+`try_` form, which changes nothing. A formula that cannot be built is an `Err`, not a panic.
 
 ## Limits
 

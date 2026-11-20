@@ -29,7 +29,7 @@ mod flex;
 mod leaf;
 mod model;
 
-use crate::tree::{finite_edges, NodeLayout};
+use crate::tree::{finite_edges, BoxEdges, NodeLayout};
 use crate::{Available, Display, Length, MeasureInput, MeasureOutput, Measurer, NodeId, Size, Style, Tree};
 
 use axis::Axis;
@@ -425,9 +425,11 @@ fn finish(tree: &mut Tree, node: NodeId, model: &BoxModel, size: Size<f32>, exte
     raw.rect.width = size.width;
     raw.rect.height = size.height;
     // Published as they are: finite, whatever a hostile style made of them.
-    raw.margin = finite_edges(model.margin);
-    raw.padding = finite_edges(model.padding);
-    raw.border = finite_edges(model.border);
+    raw.unsnapped = BoxEdges {
+        margin: finite_edges(model.margin),
+        padding: finite_edges(model.padding),
+        border: finite_edges(model.border),
+    };
     let padding_box = Size::new(
         (size.width - model.border.horizontal()).max(0.0),
         (size.height - model.border.vertical()).max(0.0),

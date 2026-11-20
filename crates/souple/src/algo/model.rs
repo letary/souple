@@ -39,18 +39,18 @@ impl BoxModel {
     pub fn resolve(style: &Style, parent: Size<Option<f32>>, content: Option<Axis>) -> Self {
         let base = parent.width;
         let edges = |lengths: &Edges<Length>| Edges {
-            left: lengths.left.resolve_or_zero(base).max(0.0),
-            top: lengths.top.resolve_or_zero(base).max(0.0),
-            right: lengths.right.resolve_or_zero(base).max(0.0),
-            bottom: lengths.bottom.resolve_or_zero(base).max(0.0),
+            left: lengths.left.px_or_zero(base).max(0.0),
+            top: lengths.top.px_or_zero(base).max(0.0),
+            right: lengths.right.px_or_zero(base).max(0.0),
+            bottom: lengths.bottom.px_or_zero(base).max(0.0),
         };
         let padding = edges(&style.padding);
         let border = edges(&style.border);
         let margin = Edges {
-            left: style.margin.left.resolve_or_zero(base),
-            top: style.margin.top.resolve_or_zero(base),
-            right: style.margin.right.resolve_or_zero(base),
-            bottom: style.margin.bottom.resolve_or_zero(base),
+            left: style.margin.left.px_or_zero(base),
+            top: style.margin.top.px_or_zero(base),
+            right: style.margin.right.px_or_zero(base),
+            bottom: style.margin.bottom.px_or_zero(base),
         };
         let margin_auto = Edges {
             left: style.margin.left.is_auto(),
@@ -66,7 +66,7 @@ impl BoxModel {
             }
             let horizontal = axis.is_horizontal();
             // A formula may compute below zero; CSS clamps a size at 0.
-            let px = length.resolve(parent.get(horizontal))?.max(0.0);
+            let px = length.px(parent.get(horizontal))?.max(0.0);
             Some(if border_box { px } else { px + pb.get(horizontal) })
         };
         let pair = |lengths: &Size<Length>| {
@@ -148,7 +148,7 @@ pub(crate) fn relative_offset(style: &Style, parent: Size<Option<f32>>) -> (f32,
         return (0.0, 0.0);
     }
     let inset = &style.inset;
-    let x = inset.left.resolve(parent.width).or_else(|| inset.right.resolve(parent.width).map(|right| -right));
-    let y = inset.top.resolve(parent.height).or_else(|| inset.bottom.resolve(parent.height).map(|bottom| -bottom));
+    let x = inset.left.px(parent.width).or_else(|| inset.right.px(parent.width).map(|right| -right));
+    let y = inset.top.px(parent.height).or_else(|| inset.bottom.px(parent.height).map(|bottom| -bottom));
     (x.unwrap_or(0.0), y.unwrap_or(0.0))
 }

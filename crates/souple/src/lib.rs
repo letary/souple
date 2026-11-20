@@ -19,6 +19,7 @@
 // embedder numbers), a cascade, text. Text and every other content-sized leaf is a Measurer call.
 
 mod algo;
+mod debug;
 mod edits;
 mod geometry;
 mod id;
@@ -35,5 +36,6 @@ pub use style::{
     AlignContent, AlignItems, BoxSizing, Display, FlexDirection, FlexWrap, JustifyContent, Overflow,
     Position, Style,
 };
-pub use tree::{Change, NodeLayout, Tree, Viewport};
+pub use edits::EditError;
+pub use tree::{BoxEdges, Change, NodeLayout, Tree, Viewport};
 pub use value::{Formula, FormulaError, Length, Op, VarId, VarSet, MAX_VARS};

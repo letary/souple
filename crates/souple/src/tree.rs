@@ -10,7 +10,7 @@ use std::num::NonZeroU32;
 use crate::algo;
 use crate::edits::Links;
 use crate::vars::Pending;
-use crate::{Edges, Measurer, NodeId, Rect, Size, Style, VarId, VarSet, MAX_VARS};
+use crate::{EditError, Edges, Measurer, NodeId, Rect, Size, Style, VarId, VarSet, MAX_VARS};
 
 /// What makes a root LIVE: the box it is laid out in. A root without one (a subtree under
 /// construction, a screen that is not shown) is never laid out.
@@ -22,7 +22,7 @@ pub enum Viewport {
     /// The content box of a node of ANOTHER tree: a pager's page in its pager, a dialog in its
     /// screen. The root is laid out after its host and follows its size; its variables continue up
     /// the host's chain. Its box is relative to the host's content box.
-    Node(NodeId),
+    Host(NodeId),
 }
 
 impl Viewport {
@@ -46,9 +46,9 @@ impl Viewport {
         Self::Size(Size::new(None, None))
     }
 
-    /// The content box of `host`, a node of another tree.
-    pub fn node(host: NodeId) -> Self {
-        Self::Node(host)
+    /// The content box of `host`, a node of another tree: the root is shown inside it.
+    pub fn host(host: NodeId) -> Self {
+        Self::Host(host)
     }
 
     /// An axis that is not a finite number is unbounded.
@@ -63,21 +63,35 @@ impl Viewport {
     }
 }
 
-/// The laid-out box of a node, in logical px, snapped to the device grid. Every number is finite.
+/// The laid-out box of a node, in logical px. Every number is finite.
+///
+/// Two kinds of number: the border box and the content's extent are SNAPPED to the device grid —
+/// where a view goes and how big it is — and the margins, the padding and the border widths are
+/// what the layout resolved, UNROUNDED, under [`NodeLayout::unsnapped`] — what an embedder sums its
+/// own extents with.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct NodeLayout {
-    /// The border box; the origin is relative to the parent's border box (a hosted root's: to its
-    /// host's content box).
+    /// The border box, snapped; the origin is relative to the parent's border box (a hosted root's:
+    /// to its host's content box).
     pub rect: Rect,
-    /// The resolved margins, unrounded; an `auto` margin is 0 here (the space it took is in the
-    /// origin). What an embedder sums its own extents with (a scroll view's content height).
-    pub margin: Edges<f32>,
-    /// The resolved padding, unrounded.
-    pub padding: Edges<f32>,
-    /// The resolved border widths, unrounded.
-    pub border: Edges<f32>,
-    /// The extent of the content, from the padding box's origin: what a scroll container scrolls.
+    /// The extent of the content from the padding box's origin, snapped: what a scroll container
+    /// scrolls.
     pub content_size: Size<f32>,
+    /// The margins, the padding and the border widths, unrounded.
+    pub unsnapped: BoxEdges,
+}
+
+/// A node's resolved margins, padding and border widths, in logical px, NOT snapped to the device
+/// grid ([`NodeLayout::unsnapped`]): the snapped border box is [`NodeLayout::rect`].
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BoxEdges {
+    /// The resolved margins; an `auto` margin is 0 here (the space it took is in the origin). What
+    /// an embedder sums its own extents with (a scroll view's content height).
+    pub margin: Edges<f32>,
+    /// The resolved padding.
+    pub padding: Edges<f32>,
+    /// The resolved border widths.
+    pub border: Edges<f32>,
 }
 
 /// A number as published: a NaN is 0, an infinity the largest finite `f32` of its sign, any other
@@ -137,8 +151,8 @@ pub struct Change {
     pub moved: bool,
     /// The width or the height.
     pub resized: bool,
-    /// The margin, the padding, the border or the content size.
-    pub inner: bool,
+    /// The box model: the margin, the padding, the border or the content size.
+    pub box_model: bool,
 }
 
 pub(crate) struct Styles {
@@ -185,7 +199,7 @@ pub(crate) struct Meta {
     pub subtree_uses: VarSet,
     /// The variables the node defines.
     pub defs: Vec<(VarId, f32)>,
-    /// A root is the viewport of some other root (`Viewport::Node`), or its scope host
+    /// A root is the viewport of some other root (`Viewport::Host`), or its scope host
     /// (`Tree::set_scope_host`). Only ever set.
     pub hosts: bool,
     /// A root's scope host (`Tree::set_scope_host`): where its scope chain goes on.
@@ -216,8 +230,10 @@ pub(crate) struct Meta {
 /// marked measured ([`Tree::set_measured`]) is sized by the [`Measurer`].
 ///
 /// A `NodeId` that is stale (its node was destroyed) panics in every method that takes one; so does
-/// an edit that the method documents as refused (a cycle, a viewport on a child). Numbers never
-/// panic.
+/// an edit that the method documents as refused (a cycle, a viewport on a child) — whose `try_` form
+/// ([`Tree::try_insert`], [`Tree::try_set_viewport`], [`Tree::try_set_scope_host`]) answers an
+/// [`EditError`] instead and changes nothing. Numbers never panic. `{:?}` is a bounded dump of the
+/// tree, `{:#?}` all of it.
 pub struct Tree {
     pub(crate) links: Vec<Links>,
     pub(crate) styles: Vec<Styles>,
@@ -231,20 +247,20 @@ pub struct Tree {
 
     /// The live roots, in the order they got a viewport.
     pub(crate) roots: Vec<NodeId>,
-    /// (host, root) of every `Viewport::Node`.
+    /// (host, root) of every `Viewport::Host`.
     pub(crate) hosted: Vec<(NodeId, NodeId)>,
     /// (host, root) of every scope host (`Tree::set_scope_host`).
     pub(crate) scope_hosted: Vec<(NodeId, NodeId)>,
     pub(crate) pending: Vec<Pending>,
     /// The value of each variable where no node up the chain defines it (`set_global`).
-    pub(crate) globals: [f32; MAX_VARS as usize],
+    pub(crate) globals: [f32; MAX_VARS],
     /// The globals set since the last pass: every style that reads one is resolved again.
     pub(crate) globals_changed: VarSet,
     pub(crate) needs_layout: bool,
     changes: Vec<Change>,
     /// The device px per logical px. A box published at another one is snapped again, its whole
     /// subtree with it, the ones the algorithm answered from its cache included (`Meta::scale`).
-    scale: f32,
+    pub(crate) scale: f32,
     pass: u32,
     /// Counts the resolve sweeps (`vars.rs`).
     pub(crate) sweep: u32,
@@ -272,7 +288,7 @@ impl Tree {
             hosted: Vec::new(),
             scope_hosted: Vec::new(),
             pending: Vec::new(),
-            globals: [0.0; MAX_VARS as usize],
+            globals: [0.0; MAX_VARS],
             globals_changed: VarSet::EMPTY,
             needs_layout: false,
             changes: Vec::new(),
@@ -342,7 +358,7 @@ impl Tree {
     }
 
     /// Frees the node and its whole subtree; their ids are stale from now on. A root hosted by a
-    /// freed node loses its viewport (`Viewport::Node`) or its scope host.
+    /// freed node loses its viewport (`Viewport::Host`) or its scope host.
     pub fn destroy(&mut self, node: NodeId) {
         self.slot(node);
         if self.links[node.slot()].parent.is_some() {
@@ -411,22 +427,8 @@ impl Tree {
         if self.styles[slot].authored == style {
             return;
         }
-        let uses = style.vars();
-        self.meta[slot].uses = uses;
-        self.add_uses(node, uses);
-        if uses.is_empty() {
-            // No variable: the style is its own computed form. It differs from the authored one
-            // (checked above), so only a style that HAD variables needs comparing again.
-            let changed = self.styles[slot].resolved.as_deref().is_none_or(|computed| *computed != style);
-            self.styles[slot] = Styles { authored: style, resolved: None };
-            if changed {
-                self.mark_dirty(node);
-            }
-        } else {
-            // Resolved at the next pass: the scope may still change (a node styled, then inserted).
-            self.styles[slot].authored = style;
-            self.pending.push(Pending { node, vars: uses, subtree: false });
-        }
+        self.styles[slot].authored = style;
+        self.restyled(node, slot);
     }
 
     /// Edits the node's style in place: `tree.update_style(node, |style| style.flex_grow = 1.0)`.
@@ -434,6 +436,56 @@ impl Tree {
         let mut style = self.style(node).clone();
         edit(&mut style);
         self.set_style(node, style);
+    }
+
+    /// Edits the node's style where it is, for a caller that knows what it changed: `edit` answers
+    /// whether it changed anything, and `false` leaves the node as it was.
+    ///
+    /// `update_style` copies the style, and `set_style` compares the whole of it with the one it
+    /// replaces; this does neither — the way in for an embedder that writes one property at a time
+    /// and can tell an unchanged value itself:
+    ///
+    /// ```
+    /// # use souple::{Length, Tree};
+    /// # let mut tree = Tree::new();
+    /// # let node = tree.create_node();
+    /// let width = Length::Px(100.0);
+    /// tree.edit_style(node, |style| {
+    ///     let changed = style.size.width != width;
+    ///     style.size.width = width;
+    ///     changed
+    /// });
+    /// ```
+    ///
+    /// The answer must be `true` whenever the style changed: a change answered `false` is not
+    /// laid out (and a later pass may never see it). A `true` for a style that did not change only
+    /// costs a pass the node did not need.
+    pub fn edit_style(&mut self, node: NodeId, edit: impl FnOnce(&mut Style) -> bool) {
+        let slot = self.slot(node);
+        if edit(&mut self.styles[slot].authored) {
+            self.restyled(node, slot);
+        }
+    }
+
+    /// The node's authored style was replaced by a different one: what it reads, and what it lays
+    /// out at the next pass.
+    fn restyled(&mut self, node: NodeId, slot: usize) {
+        let uses = self.styles[slot].authored.vars();
+        self.meta[slot].uses = uses;
+        self.add_uses(node, uses);
+        if uses.is_empty() {
+            // No variable: the style is its own computed form. It differs from the authored one it
+            // replaced, so only a style that HAD variables needs comparing again.
+            let styles = &mut self.styles[slot];
+            let changed = styles.resolved.as_deref().is_none_or(|computed| *computed != styles.authored);
+            styles.resolved = None;
+            if changed {
+                self.mark_dirty(node);
+            }
+        } else {
+            // Resolved at the next pass: the scope may still change (a node styled, then inserted).
+            self.pending.push(Pending { node, vars: uses, subtree: false });
+        }
     }
 
     /// Makes the node a content-sized leaf (or a plain box again). A measured leaf's children are
@@ -502,16 +554,27 @@ impl Tree {
     ///
     /// # Panics
     ///
-    /// If `root` has a parent, or `host` (of a `Viewport::Node`) is `root` or leads up to it — by
-    /// its parents, or a root's viewport host or scope host, whichever is in use.
+    /// Where [`Tree::try_set_viewport`] refuses: `root` has a parent, `host` (of a
+    /// `Viewport::Host`) is `root` or leads up to it — by its parents, or a root's viewport host or
+    /// scope host, whichever is in use — or a node named was destroyed.
     pub fn set_viewport(&mut self, root: NodeId, viewport: Viewport) {
-        let slot = self.slot(root);
-        assert!(self.links[slot].parent.is_none(), "only a root has a viewport");
-        if let Viewport::Node(host) = viewport {
-            self.slot(host);
-            assert!(!self.leads_to(host, root), "a root cannot be hosted inside itself");
+        self.try_set_viewport(root, viewport).unwrap_or_else(|error| panic!("Tree::set_viewport: {error}"));
+    }
+
+    /// [`Tree::set_viewport`], or why the tree refuses it — and then it changes nothing.
+    pub fn try_set_viewport(&mut self, root: NodeId, viewport: Viewport) -> Result<(), EditError> {
+        let slot = self.live(root)?;
+        if self.links[slot].parent.is_some() {
+            return Err(EditError::NotARoot);
+        }
+        if let Viewport::Host(host) = viewport {
+            self.live(host)?;
+            if self.leads_to(host, root) {
+                return Err(EditError::Cycle);
+            }
         }
         self.set_viewport_unchecked(root, Some(viewport.sanitized()));
+        Ok(())
     }
 
     /// Takes the root's viewport away: no pass lays it out, its boxes stay as they are.
@@ -526,7 +589,7 @@ impl Tree {
         if old == viewport {
             return;
         }
-        if let Some(Viewport::Node(_)) = old {
+        if let Some(Viewport::Host(_)) = old {
             self.hosted.retain(|(_, hosted)| *hosted != root);
         }
         match (old.is_some(), viewport.is_some()) {
@@ -535,7 +598,7 @@ impl Tree {
             _ => {}
         }
         self.meta[slot].viewport = viewport;
-        if let Some(Viewport::Node(host)) = viewport {
+        if let Some(Viewport::Host(host)) = viewport {
             self.hosted.push((host, root));
             self.meta[host.slot()].hosts = true;
         }
@@ -546,7 +609,7 @@ impl Tree {
         // nothing. A size given, taken and given again (an embedder that lays a root out on
         // demand) leaves the chain — and every style resolved in it — as it was.
         let host = |viewport: Option<Viewport>| match viewport {
-            Some(Viewport::Node(host)) => Some(host),
+            Some(Viewport::Host(host)) => Some(host),
             _ => None,
         };
         if host(old) != host(viewport) {
@@ -572,7 +635,7 @@ impl Tree {
                 Some(parent) => Some(parent),
                 None => {
                     let viewport_host = match self.meta[slot].viewport {
-                        Some(Viewport::Node(host)) => Some(host),
+                        Some(Viewport::Host(host)) => Some(host),
                         _ => None,
                     };
                     match (viewport_host, self.meta[slot].scope_host) {
@@ -657,13 +720,13 @@ impl Tree {
         // The box to lay out in, and where it is: the origin of the root's space, unrounded.
         let (size, origin) = match self.meta[slot].viewport.expect("a live root has a viewport") {
             Viewport::Size(size) => (size, (0.0, 0.0)),
-            Viewport::Node(host) => {
+            Viewport::Host(host) => {
                 let host_root = self.root_of(host);
                 if self.meta[host_root.slot()].viewport.is_some() {
                     self.compute_root(host_root, measurer);
                 }
                 let host_slot = host.slot();
-                let NodeLayout { rect, padding, border, .. } = self.raw[host_slot];
+                let NodeLayout { rect, unsnapped: BoxEdges { padding, border, .. }, .. } = self.raw[host_slot];
                 let left = border.left + padding.left;
                 let top = border.top + padding.top;
                 let width = (rect.width - left - border.right - padding.right).max(0.0);
@@ -700,8 +763,8 @@ impl Tree {
             origin = (origin.0 + rect.x, origin.1 + rect.y);
             match (self.links[slot].parent, self.meta[slot].viewport) {
                 (Some(parent), _) => at = parent,
-                (None, Some(Viewport::Node(host))) => {
-                    let NodeLayout { padding, border, .. } = self.raw[host.slot()];
+                (None, Some(Viewport::Host(host))) => {
+                    let BoxEdges { padding, border, .. } = self.raw[host.slot()].unsnapped;
                     origin = (origin.0 + border.left + padding.left, origin.1 + border.top + padding.top);
                     at = host;
                 }
@@ -754,10 +817,8 @@ impl Tree {
                 width: (right - left).max(0.0) / scale,
                 height: (bottom - top).max(0.0) / scale,
             },
-            margin: raw.margin,
-            padding: raw.padding,
-            border: raw.border,
             content_size: Size::new(self.snap(raw.content_size.width), self.snap(raw.content_size.height)),
+            unsnapped: raw.unsnapped,
         }
         .finite();
         let old = self.out[slot];
@@ -769,8 +830,7 @@ impl Tree {
                 node,
                 moved: (new.rect.x, new.rect.y) != (old.rect.x, old.rect.y),
                 resized: (new.rect.width, new.rect.height) != (old.rect.width, old.rect.height),
-                inner: (new.margin, new.padding, new.border, new.content_size)
-                    != (old.margin, old.padding, old.border, old.content_size),
+                box_model: (new.unsnapped, new.content_size) != (old.unsnapped, old.content_size),
             });
         }
 

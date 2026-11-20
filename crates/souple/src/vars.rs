@@ -2,7 +2,7 @@
 //!
 //! A node may define any variable ([`Tree::set_var`]); a style's `Length::Var` reads the nearest
 //! definition from the node up — its parents, then, for a hosted root, its host's chain (the host
-//! of its `Viewport::Node`, else its scope host, [`Tree::set_scope_host`]) — and the tree's GLOBAL
+//! of its `Viewport::Host`, else its scope host, [`Tree::set_scope_host`]) — and the tree's GLOBAL
 //! value when nobody defines it ([`Tree::set_global`], 0 until set). So `vw` is a
 //! global, `em` is defined on every node that sets a font size, `safe-bottom` is a global and is
 //! defined again on the subtree a tab bar covers.
@@ -12,7 +12,7 @@
 //! really changed. What needs resolving is queued (`pending`) and done at the start of a pass, so
 //! a tree built bottom-up is resolved once, in its final place.
 
-use crate::{Tree, NodeId, VarId, VarSet, Viewport};
+use crate::{EditError, NodeId, Tree, VarId, VarSet, Viewport};
 
 /// A resolve to do at the next pass.
 pub(crate) struct Pending {
@@ -80,34 +80,45 @@ impl Tree {
     pub(crate) fn scope_parent(&self, node: NodeId) -> Option<NodeId> {
         let slot = node.slot();
         self.links[slot].parent.or(match self.meta[slot].viewport {
-            Some(Viewport::Node(host)) => Some(host),
+            Some(Viewport::Host(host)) => Some(host),
             _ => self.meta[slot].scope_host,
         })
     }
 
     /// Continues a ROOT's scope chain at `host` (`None` ends it at the root again): the root and its
     /// subtree read the variables defined up the host's chain, as a root hosted by a
-    /// `Viewport::Node` does — and that is ALL the link does. The root is laid out by whoever lays
+    /// `Viewport::Host` does — and that is ALL the link does. The root is laid out by whoever lays
     /// it out (its own viewport, given for a pass or kept), never in the host's box, and the host's
     /// layout never waits for it. What an embedder links this way is a root it hosts logically and
     /// lays out itself: a list's item, a widget declared in a screen, an inline run of a text.
     ///
     /// A child's chain is its parent's: inserting the root drops the link. While the root has a
-    /// `Viewport::Node`, the chain goes through that host instead, and through this one again once
+    /// `Viewport::Host`, the chain goes through that host instead, and through this one again once
     /// the viewport goes.
     ///
     /// # Panics
     ///
-    /// If `root` has a parent, or the chain would come back to the root: `host` is in the root's
-    /// tree, or leads up to it by any link (parents, a root's viewport host or scope host).
+    /// Where [`Tree::try_set_scope_host`] refuses: `root` has a parent, the chain would come back to
+    /// the root — `host` is in the root's tree, or leads up to it by any link (parents, a root's
+    /// viewport host or scope host) — or a node named was destroyed.
     pub fn set_scope_host(&mut self, root: NodeId, host: Option<NodeId>) {
-        let slot = self.slot(root);
-        assert!(self.links[slot].parent.is_none(), "only a root has a scope host");
+        self.try_set_scope_host(root, host).unwrap_or_else(|error| panic!("Tree::set_scope_host: {error}"));
+    }
+
+    /// [`Tree::set_scope_host`], or why the tree refuses it — and then it changes nothing.
+    pub fn try_set_scope_host(&mut self, root: NodeId, host: Option<NodeId>) -> Result<(), EditError> {
+        let slot = self.live(root)?;
+        if self.links[slot].parent.is_some() {
+            return Err(EditError::NotARoot);
+        }
         if let Some(host) = host {
-            self.slot(host);
-            assert!(!self.leads_to(host, root), "a root cannot be hosted inside itself");
+            self.live(host)?;
+            if self.leads_to(host, root) {
+                return Err(EditError::Cycle);
+            }
         }
         self.set_scope_host_unchecked(root, host);
+        Ok(())
     }
 
     /// The root's scope host (`None` for a child and for a root without one).

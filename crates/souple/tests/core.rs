@@ -1,7 +1,7 @@
 //! The engine around the algorithm: the tree, the variable scopes, what a pass has to do.
 //! (The boxes themselves are the fixture suite's.)
 
-use souple::{Tree, Length, NoMeasure, NodeId, Size, Style, VarId, Viewport};
+use souple::{EditError, Length, NoMeasure, NodeId, Size, Style, Tree, VarId, Viewport};
 
 const EM: VarId = VarId::new(0);
 const VW: VarId = VarId::new(1);
@@ -104,7 +104,7 @@ fn a_hosted_root_reads_through_its_host() {
     tree.set_var(root, VW, Some(4.0));
 
     let page = tree.create_node();
-    tree.set_viewport(page, Viewport::node(host));
+    tree.set_viewport(page, Viewport::host(host));
     assert_eq!(tree.var(page, VW), 4.0);
 
     tree.destroy(host);
@@ -214,7 +214,7 @@ fn a_hosted_root_follows_its_hosts_content_box() {
     let fill = tree.create_node();
     tree.append(page, fill);
     tree.set_style(fill, width(Length::Percent(50.0)));
-    tree.set_viewport(page, Viewport::node(host));
+    tree.set_viewport(page, Viewport::host(host));
     tree.compute_layout(&mut NoMeasure);
     // The page is the host's content box (the default box-sizing sizes it: 200 × 100), inside the padding.
     assert_eq!((tree.layout(host).rect.width, tree.layout(host).rect.height), (220.0, 120.0));
@@ -386,7 +386,7 @@ fn a_first_publish_is_a_change_even_of_an_empty_box() {
     tree.compute_layout(&mut NoMeasure);
     let changes = tree.changes().to_vec();
     let first = changes.iter().find(|change| change.node == empty).expect("the 0 x 0 box is reported");
-    assert!(!first.moved && !first.resized && !first.inner, "nothing differs from the default box");
+    assert!(!first.moved && !first.resized && !first.box_model, "nothing differs from the default box");
     assert_eq!(tree.layout(empty).rect.width, 0.0);
     tree.set_viewport(root, Viewport::size(300.0, 800.0));
     tree.compute_layout(&mut NoMeasure);
@@ -405,7 +405,7 @@ fn the_resolved_margins_are_published() {
         ..Style::default()
     });
     tree.compute_layout(&mut NoMeasure);
-    let margin = tree.layout(child).margin;
+    let margin = tree.layout(child).unsnapped.margin;
     assert_eq!((margin.left, margin.top, margin.right, margin.bottom), (0.0, 4.0, 40.0, 6.0), "auto is 0, a percent is of the width");
 }
 
@@ -493,8 +493,19 @@ fn a_scope_host_lends_its_variables_and_nothing_else() {
 }
 
 #[test]
-#[should_panic(expected = "hosted inside itself")]
 fn a_scope_host_inside_the_root_is_refused() {
+    let mut tree = Tree::new();
+    let item = tree.create_node();
+    let inner = tree.create_node();
+    tree.append(item, inner);
+    let before = format!("{tree:#?}");
+    assert_eq!(tree.try_set_scope_host(item, Some(inner)), Err(EditError::Cycle));
+    assert_eq!(format!("{tree:#?}"), before, "refused: nothing changed");
+}
+
+#[test]
+#[should_panic(expected = "Tree::set_scope_host: a node cannot be under itself")]
+fn the_plain_form_panics_with_the_refusal() {
     let mut tree = Tree::new();
     let item = tree.create_node();
     let inner = tree.create_node();
@@ -503,13 +514,14 @@ fn a_scope_host_inside_the_root_is_refused() {
 }
 
 #[test]
-#[should_panic(expected = "inserted under itself")]
 fn a_host_inserted_under_its_hosted_root_is_refused() {
     let mut tree = Tree::new();
     let host = tree.create_node();
     let item = tree.create_node();
     tree.set_scope_host(item, Some(host));
-    tree.append(item, host);
+    let before = format!("{tree:#?}");
+    assert_eq!(tree.try_append(item, host), Err(EditError::Cycle));
+    assert_eq!(format!("{tree:#?}"), before, "refused: nothing changed");
 }
 
 #[test]
@@ -525,4 +537,165 @@ fn a_root_laid_out_on_demand_says_when_it_is_dirty() {
     assert!(!tree.needs_layout_at(item) && !tree.needs_layout_at(leaf));
     tree.set_style(leaf, width(Length::Px(10.0)));
     assert!(tree.needs_layout_at(item) && tree.needs_layout_at(leaf), "an edit marks the chain to the root");
+}
+
+/// Two trees, edited the same way — one by `set_style`, the other in place by `edit_style` — lay
+/// out, report and measure the same through every path a restyle takes: a plain length, the same
+/// value (answered unchanged, and answered changed), a variable read for the first time and then
+/// moved, a variable's factor, a variable dropped for the px it computed to (no layout), and for
+/// other px.
+#[test]
+fn an_edit_in_place_is_the_edit_set_style_makes() {
+    use souple::{Available, MeasureInput, MeasureOutput};
+    struct Twin {
+        tree: Tree,
+        root: NodeId,
+        box_: NodeId,
+        text: NodeId,
+    }
+    fn twin() -> Twin {
+        let mut tree = Tree::new();
+        let root = screen(&mut tree);
+        let box_ = tree.create_node();
+        let text = tree.create_node();
+        tree.append(root, box_);
+        tree.append(box_, text);
+        tree.set_measured(text, true);
+        tree.set_var(root, EM, Some(10.0));
+        Twin { tree, root, box_, text }
+    }
+    // A text that wraps: its size depends on the width it is offered.
+    let pass = |twin: &mut Twin| {
+        let mut calls = 0;
+        let mut measure = |_: NodeId, input: MeasureInput| {
+            calls += 1;
+            let offered = match input.available.width {
+                Available::Definite(width) => width,
+                _ => 400.0,
+            };
+            let room = input.known.width.unwrap_or(offered).max(1.0);
+            MeasureOutput { size: Size::new(room.min(300.0), (300.0 / room).ceil() * 10.0), baseline: None }
+        };
+        let needed = twin.tree.needs_layout();
+        twin.tree.compute_layout(&mut measure);
+        let changes = twin.tree.changes().to_vec();
+        (needed, changes, calls, [twin.root, twin.box_, twin.text].map(|n| *twin.tree.layout(n)))
+    };
+    let (mut set, mut edit) = (twin(), twin());
+    assert_eq!(pass(&mut set), pass(&mut edit), "the first pass");
+
+    // (length, what the in-place edit answers: `None` = whether it changed, `Some` = that)
+    let steps: [(Length, Option<bool>); 8] = [
+        (Length::Px(200.0), None),            // no variable before or after: laid out
+        (Length::Px(200.0), None),            // the same value: answered unchanged, nothing to do
+        (Length::Px(200.0), Some(true)),      // the same value answered changed: no harm
+        (Length::Var(EM, 15.0), None),        // a variable read for the first time: resolved at the pass
+        (Length::Var(EM, 12.0), None),        // its factor moved: resolved again
+        (Length::Px(120.0), None),            // dropped for the px it computed to: no layout
+        (Length::Px(90.0), None),             // and for other px: laid out
+        (Length::Var(EM, 9.0), None),         // read again; the variable's moves reach it (below)
+    ];
+    for (at, (length, answer)) in steps.into_iter().enumerate() {
+        set.tree.set_style(set.box_, width(length.clone()));
+        edit.tree.edit_style(edit.box_, |style| {
+            let changed = style.size.width != length;
+            style.size.width = length;
+            answer.unwrap_or(changed)
+        });
+        assert_eq!(set.tree.style(set.box_), edit.tree.style(edit.box_), "step {at}");
+        let (a, b) = (pass(&mut set), pass(&mut edit));
+        assert_eq!(a.3, b.3, "step {at}: the boxes");
+        if answer.is_none() {
+            assert_eq!(a, b, "step {at}: what needed a pass, what changed, what was measured");
+        } else {
+            assert!(b.1.is_empty(), "step {at}: an unchanged style answered changed moves nothing");
+        }
+        if at == 1 || at == 5 {
+            assert!(!b.0 && b.1.is_empty() && b.2 == 0, "step {at}: no pass needed, no change, no measure");
+        }
+    }
+    // The variable the last edit made the box read: a new value reaches it.
+    set.tree.set_var(set.root, EM, Some(20.0));
+    edit.tree.set_var(edit.root, EM, Some(20.0));
+    let (a, b) = (pass(&mut set), pass(&mut edit));
+    assert_eq!(a, b);
+    assert_eq!(b.3[1].rect.width, 180.0, "9em of 20");
+}
+
+/// Each refusal of the `try_` edits names its rule — and leaves the tree as it was: its dump (boxes,
+/// dirtiness, links, styles), whether a pass is needed, and what the next pass reports.
+#[test]
+fn every_refusal_names_its_rule_and_changes_nothing() {
+    let mut tree = Tree::new();
+    let root = screen(&mut tree);
+    let [child, grandchild] = [tree.create_node(), tree.create_node()];
+    tree.append(root, child);
+    tree.append(child, grandchild);
+    let shown = screen(&mut tree); // another live root: it has a viewport
+    let loose = tree.create_node(); // a root without one
+    let gone = tree.create_node();
+    tree.destroy(gone);
+    tree.set_style(child, width(Length::Px(50.0)));
+    tree.compute_layout(&mut NoMeasure);
+    // (what, the edit over [root, child, grandchild, shown, loose, gone], the refusal)
+    type Edit = fn(&mut Tree, [NodeId; 6]) -> Result<(), EditError>;
+    let refusals: [(&str, Edit, EditError); 9] = [
+        ("a node under itself", |t, [_, child, ..]| t.try_append(child, child), EditError::Cycle),
+        ("a node under its grandchild", |t, [_, child, grandchild, ..]| t.try_append(grandchild, child), EditError::Cycle),
+        ("a root with a viewport as a child", |t, [root, _, _, shown, ..]| t.try_append(root, shown), EditError::HasViewport),
+        ("before = the child", |t, [root, _, _, _, loose, _]| t.try_insert(root, loose, Some(loose)), EditError::NotASibling),
+        ("before not a child of the parent", |t, [root, _, grandchild, _, loose, _]| t.try_insert(root, loose, Some(grandchild)), EditError::NotASibling),
+        ("a viewport on a child", |t, [_, child, ..]| t.try_set_viewport(child, Viewport::size(10.0, 10.0)), EditError::NotARoot),
+        ("a root hosted inside itself", |t, [root, _, grandchild, ..]| t.try_set_viewport(root, Viewport::host(grandchild)), EditError::Cycle),
+        ("a scope host on a child", |t, [_, child, _, _, loose, _]| t.try_set_scope_host(child, Some(loose)), EditError::NotARoot),
+        ("a destroyed node", |t, [root, _, _, _, _, gone]| t.try_append(root, gone), EditError::Destroyed),
+    ];
+    for (what, edit, error) in refusals {
+        let before = (format!("{tree:#?}"), tree.needs_layout());
+        assert_eq!(edit(&mut tree, [root, child, grandchild, shown, loose, gone]), Err(error), "{what}");
+        assert_eq!((format!("{tree:#?}"), tree.needs_layout()), before, "{what}: the tree is as it was");
+        tree.compute_layout(&mut NoMeasure);
+        assert!(tree.changes().is_empty(), "{what}: the next pass has nothing to report");
+    }
+    assert!(EditError::Cycle.to_string().contains("under itself"));
+    // And an accepted one changes what it says.
+    assert_eq!(tree.try_append(root, loose), Ok(()));
+    assert_eq!(tree.parent(loose), Some(root));
+}
+
+#[test]
+fn a_dump_shows_the_roots_their_boxes_and_what_their_styles_change() {
+    let mut tree = Tree::new();
+    let root = screen(&mut tree);
+    let child = tree.create_node();
+    tree.append(root, child);
+    tree.set_style(child, Style { padding: souple::Edges::all(Length::Px(4.0)), ..width(Length::Px(120.0)) });
+    tree.set_measured(child, true);
+    let host = tree.create_node();
+    tree.set_viewport(host, Viewport::host(child));
+    tree.compute_layout(&mut NoMeasure);
+    let dump = format!("{tree:?}");
+    assert!(dump.starts_with("Tree { 3 nodes, 2 roots (2 live)"), "{dump}");
+    assert!(dump.contains(&format!("n{} @ 0,0 400×800 [viewport 400×800]", root.index())), "{dump}");
+    assert!(dump.contains(&format!("  n{} @ 0,0 128×800 measured {{ width: 120px, padding: 4px }}", child.index())), "{dump}");
+    assert!(dump.contains(&format!("[hosted in n{}]", child.index())), "{dump}");
+}
+
+#[test]
+fn a_dump_of_a_large_tree_is_bounded_unless_asked_for_all() {
+    let mut tree = Tree::new();
+    let root = screen(&mut tree);
+    for _ in 0..100 {
+        let row = tree.create_node();
+        tree.append(root, row);
+        for _ in 0..99 {
+            let cell = tree.create_node();
+            tree.append(row, cell);
+        }
+    }
+    let short = format!("{tree:?}");
+    assert!(short.lines().count() < 70 && short.len() < 8_000, "{} lines, {} bytes", short.lines().count(), short.len());
+    assert!(short.contains("… 9937 more nodes under"), "{short}");
+    let all = format!("{tree:#?}");
+    assert_eq!(all.lines().count(), 1 + 10_001, "the summary and every node");
 }

@@ -33,7 +33,7 @@ fn known(model: &BoxModel, input: &Input) -> Size<Option<f32>> {
 /// content question sets its size properties aside (a row's flex base size, a contribution), since
 /// for a leaf that hugs the max is a limit on the offer, not a width to fill (`flex::content_width`).
 fn hug_limit(style: &Style, input: &Input, model: &BoxModel) -> Option<f32> {
-    let max = style.max_size.width.resolve(input.parent.width)?.max(0.0);
+    let max = style.max_size.width.px(input.parent.width)?.max(0.0);
     Some(if model.border_box { (max - model.pb().width).max(0.0) } else { max })
 }
 
