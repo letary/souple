@@ -1,0 +1,3 @@
+# The Yoga harness's CMake build tree and everything a run writes.
+/yoga-build/
+/out/

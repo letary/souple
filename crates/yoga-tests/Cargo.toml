@@ -1,0 +1,11 @@
+[package]
+name = "souple-yoga-tests"
+description = "The conformance suite of souple: Yoga's generated flexbox tests, translated"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# The importer (src/bin/import.rs) is plain std. The engine is needed only by the tests it writes.
+[dev-dependencies]
+souple = { path = "../souple" }

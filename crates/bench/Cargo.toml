@@ -1,0 +1,12 @@
+[package]
+name = "souple-bench"
+description = "Benchmarks of souple against Yoga: Yoga's captured trees, synthetic trees, the incremental scenarios"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+souple = { path = "../souple" }
+# The captures are Yoga's JSON. `unbounded_depth`: the deep synthetic trees nest thousands of levels.
+serde_json = { version = "1", features = ["unbounded_depth"] }

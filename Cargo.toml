@@ -1,0 +1,16 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# Edition 2024's minimum; `cargo clippy` checks the std APIs against it (`incompatible_msrv`).
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/letary/souple"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

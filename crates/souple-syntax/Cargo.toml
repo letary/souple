@@ -1,0 +1,16 @@
+[package]
+name = "souple-syntax"
+description = "CSS value text for the souple layout engine: lengths, calc(), min(), max(), clamp(), and declarations into its typed Style"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["css", "parser", "layout", "flexbox", "calc"]
+categories = ["parser-implementations", "gui"]
+include = ["/src", "/tests", "/README.md", "/LICENSE"]
+
+[dependencies]
+# The version is what crates.io resolves (publish souple first); the path is what this workspace builds.
+souple = { path = "../souple", version = "0.1.0" }

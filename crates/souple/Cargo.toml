@@ -1,0 +1,15 @@
+[package]
+name = "souple"
+description = "An incremental CSS flexbox layout engine: a tree of boxes, lengths kept live over scoped variables, measured leaves, pixel snapping, and the boxes that changed as each pass's output"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+keywords = ["layout", "flexbox", "css", "ui", "incremental"]
+categories = ["gui", "graphics"]
+# The library, its tests and its README: no bench data, no fixtures (those live in other crates).
+include = ["/src", "/tests", "/README.md", "/LICENSE"]
+
+[dependencies]
